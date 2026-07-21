@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Whetstone host console</title>
+<style>body{font:15px/1.5 system-ui;max-width:640px;margin:40px auto;padding:0 16px;background:#FFFCF0;color:#100F0F}
+button{font-size:15px;padding:8px 14px;margin:4px;border-radius:8px;border:1px solid #DAD8CE;background:#F2F0E5;cursor:pointer}
+textarea{width:100%;height:180px;font:13px monospace}pre{background:#F2F0E5;padding:10px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body><h2>Host console (placeholder)</h2>
+<p>Paste quiz JSON ([{"stem":"…","options":["a","b"],"answer_index":0}]), then drive the room.</p>
+<textarea id="quiz">[{"stem":"2+2?","options":["3","4","5","22"],"answer_index":1}]</textarea><br>
+<button onclick="create()">Create room</button>
+<span id="controls" style="display:none">
+<button onclick="ctl('next')">Next</button><button onclick="ctl('go')">Go</button>
+<button onclick="ctl('close')">Close</button><button onclick="ctl('leaderboard')">Leaderboard</button>
+<button onclick="ctl('podium')">Podium</button></span>
+<pre id="log"></pre><script>
+let ws;const log=t=>document.getElementById("log").textContent+=t+"\n";
+function open(cb){ws=new WebSocket(`${location.protocol==="https:"?"wss":"ws"}://${location.host}/hostws`);
+  ws.onopen=cb;ws.onmessage=e=>log(e.data);}
+function create(){open(()=>{ws.send(JSON.stringify({t:"create",quiz:JSON.parse(document.getElementById("quiz").value)}));
+  document.getElementById("controls").style.display="inline"})}
+function ctl(action){ws.send(JSON.stringify({t:"control",action}))}
+</script></body></html>

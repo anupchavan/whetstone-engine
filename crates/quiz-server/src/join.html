@@ -1,0 +1,76 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join the quiz</title>
+<style>
+  :root { --bg:#FFFCF0; --bg2:#F2F0E5; --ui:#E6E4D9; --tx:#100F0F; --tx2:#6F6E69;
+          --green:#66800B; --red:#AF3029; --orange:#BC5215; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#100F0F; --bg2:#1C1B1A; --ui:#282726; --tx:#CECDC3; --tx2:#878580;
+            --green:#879A39; --red:#D14D41; --orange:#DA702C; } }
+  * { box-sizing:border-box; margin:0 }
+  body { background:var(--bg); color:var(--tx); font:16px/1.5 -apple-system,system-ui,sans-serif;
+         min-height:100vh; display:flex; align-items:center; justify-content:center; padding:18px }
+  .card { width:100%; max-width:430px }
+  h1 { font-size:22px; margin-bottom:14px }
+  input,button { width:100%; font-size:17px; padding:12px 14px; border-radius:10px;
+                 border:1px solid var(--ui); background:var(--bg2); color:var(--tx); margin-bottom:10px }
+  button { background:var(--tx); color:var(--bg); border:0; font-weight:600; cursor:pointer }
+  .option { text-align:left; margin-bottom:9px; background:var(--bg2); color:var(--tx) }
+  .option.picked { outline:2.5px solid var(--tx) }
+  .option.correct { outline:2.5px solid var(--green) }
+  .option.wrong { outline:2.5px solid var(--red) }
+  .muted { color:var(--tx2); font-size:13.5px }
+  #timer { font-variant-numeric:tabular-nums; font-weight:700; font-size:28px; margin-bottom:10px }
+  .hide { display:none }
+</style></head><body><div class="card">
+<div id="join"><h1>Join the quiz</h1>
+  <input id="room" placeholder="Room PIN" inputmode="numeric" autocomplete="off">
+  <input id="name" placeholder="Your name" maxlength="24" autocomplete="off">
+  <button onclick="join()">Join</button><div class="muted" id="joinmsg"></div></div>
+<div id="wait" class="hide"><h1 id="waitmsg">You're in.</h1>
+  <div class="muted">Watch the board. The question opens here.</div></div>
+<div id="play" class="hide"><div id="timer"></div><h1 id="stem"></h1><div id="opts"></div></div>
+<div id="result" class="hide"><h1 id="verdict"></h1><div class="muted" id="score"></div></div>
+</div><script>
+let ws, offset=0, q=null, deadline=0, picked=null, token=sessionStorage.getItem("wtok");
+const $=id=>document.getElementById(id);
+const show=id=>{for(const p of["join","wait","play","result"])$(p).classList.toggle("hide",p!==id)};
+function join(){
+  ws=new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen=()=>{ const t0=Date.now();
+    ws.send(JSON.stringify({t:"ping",v:1,id:t0}));
+    ws.send(JSON.stringify({t:"join",v:1,room:$("room").value.trim(),name:$("name").value.trim(),token})); };
+  ws.onclose=()=>setTimeout(()=>{if(token)join()},800);
+  ws.onmessage=e=>{const m=JSON.parse(e.data);
+    if(m.t==="pong"){offset=m.host_ms-(Date.now()+ (Date.now()-m.id)/2 - (Date.now()-m.id));offset=m.host_ms-Date.now();}
+    if(m.t==="error"){$("joinmsg").textContent=m.reason;return}
+    if(m.t==="welcome"){token=m.token;sessionStorage.setItem("wtok",token);
+      if(m.phase.phase==="open"){stage(m.phase.question);go(m.phase.deadline_ms)}
+      else if(m.phase.phase==="staged"){stage(m.phase.question);show("wait")}
+      else show("wait");}
+    if(m.t==="stage"){stage(m.question);show("wait");$("waitmsg").textContent="Get ready…"}
+    if(m.t==="go")go(m.deadline_ms);
+    if(m.t==="closed")closed(m);
+    if(m.t==="leaderboard"&&m.you)$("score").textContent=`Score ${m.you.score} · Rank ${m.you.rank}`;
+    if(m.t==="podium"){show("result");$("verdict").textContent="Final standings are on the board";}
+  };}
+function stage(question){q=question;picked=null;
+  $("stem").textContent=q.question_text;
+  $("opts").innerHTML=q.options.map((o,i)=>`<button class="option" id="o${i}" onclick="pick(${i})">${o}</button>`).join("");}
+function go(d){deadline=d;show("play");tick();}
+function tick(){const left=Math.max(0,deadline-(Date.now()+offset));
+  $("timer").textContent=(left/1000).toFixed(1);
+  if(left>0&&picked===null)requestAnimationFrame(tick);}
+function pick(i){if(picked!==null)return;picked=i;
+  document.querySelectorAll(".option").forEach((b,j)=>b.classList.toggle("picked",j===i));
+  ws.send(JSON.stringify({t:"answer",v:1,q:q.index,choice:i,sent_at:Date.now()}));}
+function closed(m){show("play");$("timer").textContent="";
+  document.querySelectorAll(".option").forEach((b,j)=>{
+    b.classList.remove("picked");
+    if(j===m.correct)b.classList.add("correct");
+    else if(j===picked)b.classList.add("wrong");});
+  if(m.you)$("score").textContent=`Score ${m.you.score} · Rank ${m.you.rank}`;
+  setTimeout(()=>{show("result");
+    $("verdict").textContent=picked===m.correct?"Correct":(picked===null?"Time's up":"Not this one");
+  },1600);}
+</script></body></html>
