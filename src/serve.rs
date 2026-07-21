@@ -987,6 +987,13 @@ fn start_session(context: &mut ServeContext, params: &Value) -> Result<Value> {
 
     let rel_paths = select_session_notes(context, &root, rel_paths, count);
     let abs_paths: Vec<PathBuf> = rel_paths.iter().map(|rel| root.join(rel)).collect();
+    if abs_paths.iter().any(|p| p.extension().and_then(|x| x.to_str()) == Some("pdf"))
+        && !matches!(context.config.provider.as_str(), "anthropic" | "gemini")
+    {
+        bail!(
+            "PDF notes need a provider that reads documents natively. Switch to Anthropic or Google in Settings, or deselect the PDF topics."
+        );
+    }
     let loaded = collect_sources(&abs_paths).context("source preflight failed")?;
     let (sources, mut rel_by_hash) = compose_envelopes(loaded, &root, combine_topics)?;
 
@@ -1186,7 +1193,11 @@ fn compose_envelopes(
     let mut rel_by_hash: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut small_by_folder: BTreeMap<String, Vec<SourceDocument>> = BTreeMap::new();
     for source in loaded {
-        if !combine_all && source.extracted_text.trim().chars().count() >= SOLO_MIN_CHARS {
+        let native_pdf = matches!(source.payload, crate::model::SourcePayload::Pdf(_))
+            && source.extracted_text.trim().is_empty();
+        if native_pdf
+            || (!combine_all && source.extracted_text.trim().chars().count() >= SOLO_MIN_CHARS)
+        {
             rel_by_hash.insert(source.sha256.clone(), vec![rel_of(&source)]);
             sources.push(source);
         } else {

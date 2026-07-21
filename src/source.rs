@@ -59,17 +59,20 @@ fn load_source(path: PathBuf) -> Result<SourceDocument> {
         .unwrap_or("note")
         .to_owned();
     let (media_type, extracted_text, page_count, payload) = if ext == "pdf" {
-        let output = Command::new("pdftotext")
-            .args(["-layout"])
-            .arg(&path)
-            .arg("-")
-            .output()
-            .with_context(|| "pdftotext is required for deterministic PDF preflight")?;
-        if !output.status.success() {
-            bail!("PDF extraction failed for {}", path.display());
-        }
-        let text =
-            String::from_utf8_lossy(&output.stdout).replace('\u{000c}', "\n\n[PAGE BREAK]\n\n");
+        // pdftotext (poppler) gives the deterministic text preflight, but
+        // app users rarely have it: without it the PDF still works as a
+        // native document attachment, with the model reading pages itself.
+        let text = match Command::new("pdftotext").args(["-layout"]).arg(&path).arg("-").output() {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .replace('\u{000c}', "\n\n[PAGE BREAK]\n\n"),
+            _ => {
+                eprintln!(
+                    "  note: pdftotext unavailable for {} - sending the PDF natively without text preflight",
+                    path.display()
+                );
+                String::new()
+            }
+        };
         let pages = pdf_page_count(&path);
         (
             "application/pdf".to_owned(),
@@ -88,7 +91,7 @@ fn load_source(path: PathBuf) -> Result<SourceDocument> {
         )
     };
     let extracted_chars = extracted_text.trim().chars().count();
-    if ext == "pdf" && extracted_chars < MIN_PDF_EXTRACTED_CHARS {
+    if ext == "pdf" && extracted_chars > 0 && extracted_chars < MIN_PDF_EXTRACTED_CHARS {
         bail!(
             "PDF extracted too little text and needs OCR or repair: {}",
             path.display()
