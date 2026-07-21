@@ -35,6 +35,14 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// Set a default: provider | model | quality-tier | budget-usd | count.
+    Set { key: String, value: String },
+    /// Print the stored defaults and where they live.
+    Show,
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Generate a fully validated Markdown question set from note files or folders.
     Generate {
@@ -77,6 +85,13 @@ enum Command {
     },
     /// Print the manual page (install: whetstone man > /usr/local/share/man/man1/whetstone.1).
     Man,
+    /// Persist defaults so generate does not need flags every run:
+    /// whetstone config set provider ollama; whetstone config set model llama3.1;
+    /// whetstone config show.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Finalize a smaller, explicitly authorized target from fully validated cached inventory.
     Finalize {
         #[arg(long, default_value = "results/validated-inventory.json")]
@@ -90,10 +105,56 @@ enum Command {
     },
 }
 
+/// ~/.config/whetstone/defaults.json (or the platform equivalent).
+fn cli_defaults_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("whetstone").join("defaults.json")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Config { action } => {
+            let path = cli_defaults_path();
+            let mut defaults: serde_json::Value = fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            match action {
+                ConfigAction::Set { key, value } => {
+                    let key = key.replace('-', "_");
+                    match key.as_str() {
+                        "provider" | "model" | "quality_tier" => {
+                            defaults[key] = serde_json::Value::String(value);
+                        }
+                        "budget_usd" => {
+                            defaults[key] = serde_json::json!(value.parse::<f64>()
+                                .context("budget-usd must be a number")?);
+                        }
+                        "count" => {
+                            defaults[key] = serde_json::json!(value.parse::<usize>()
+                                .context("count must be a whole number")?);
+                        }
+                        other => bail!("unknown key {other}; try provider, model, quality-tier, budget-usd, count"),
+                    }
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&path, serde_json::to_vec_pretty(&defaults)?)?;
+                    println!("saved to {}", path.display());
+                }
+                ConfigAction::Show => {
+                    println!("{}", serde_json::to_string_pretty(&defaults)?);
+                    println!("# {}", path.display());
+                }
+            }
+            return Ok(());
+        }
         Command::Man => {
             let man = clap_mangen::Man::new(<Cli as clap::CommandFactory>::command());
             let mut out = Vec::new();
@@ -115,6 +176,25 @@ async fn main() -> Result<()> {
             quality_tier,
             mechanisms,
         } => {
+            // Stored defaults (whetstone config set …) fill in whatever
+            // the command line left untouched.
+            let defaults: serde_json::Value = fs::read(cli_defaults_path())
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let provider = if provider == "anthropic" {
+                defaults.get("provider").and_then(|v| v.as_str()).unwrap_or("anthropic").to_owned()
+            } else { provider };
+            let model = model.or_else(|| defaults.get("model").and_then(|v| v.as_str()).map(str::to_owned));
+            let quality_tier = if quality_tier == "olympiad_studio" {
+                defaults.get("quality_tier").and_then(|v| v.as_str()).unwrap_or(&quality_tier).to_owned()
+            } else { quality_tier };
+            let count = if count == 60 {
+                defaults.get("count").and_then(|v| v.as_u64()).map(|c| c as usize).unwrap_or(count)
+            } else { count };
+            let budget_usd = if (budget_usd - 5.0).abs() < f64::EPSILON {
+                defaults.get("budget_usd").and_then(|v| v.as_f64()).unwrap_or(budget_usd)
+            } else { budget_usd };
             if count == 0 {
                 bail!("--count must be positive");
             }

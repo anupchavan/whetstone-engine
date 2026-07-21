@@ -31,6 +31,12 @@ whetstone generate --input ~/notes --count 10 --quality-tier scholar
 
 # Run as a JSON-lines sidecar (what the apps and plugin speak)
 whetstone serve
+
+# Set defaults once; generate needs no flags after this
+whetstone config set provider ollama
+whetstone config set model llama3.1
+whetstone config set quality-tier scholar
+whetstone generate --input ~/notes --count 10
 ```
 
 Outputs land in `results/`: a Markdown question set, the JSON items, and a
