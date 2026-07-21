@@ -50,7 +50,7 @@ impl Oracle {
 
     /// Runs one verification script. Every failure path maps to `unsupported`
     /// so the caller's gate logic stays a three-way match, never an error.
-    pub fn verify(&self, verification: &mut Verification) {
+    pub fn verify(&self, verification: &mut Verification, keyed_option: &str, options: &[String]) {
         if verification.kind == "none" || verification.script.trim().is_empty() {
             verification.verdict = "not_run".into();
             verification.detail = "item declares no computable key".into();
@@ -61,7 +61,20 @@ impl Oracle {
             verification.detail = "python3 with sympy is unavailable on this machine".into();
             return;
         }
-        match self.run_harness(&verification.script) {
+        // The script must be judged against the ITEM's key, not whatever
+        // internal letter map it declares: inject the keyed option text and
+        // the real option order as constants every script can (and new
+        // scripts must) assert against.
+        let mut preamble = String::new();
+        let clean = |text: &str| text.replace("'", "\\'");
+        preamble.push_str(&format!("KEYED_OPTION = '{}'\n", clean(keyed_option)));
+        preamble.push_str("OPTIONS = [");
+        for option in options {
+            preamble.push_str(&format!("'{}', ", clean(option)));
+        }
+        preamble.push_str("]\n");
+        let script = format!("{preamble}{}", verification.script);
+        match self.run_harness(&script) {
             Ok((verdict, detail)) => {
                 verification.verdict = verdict;
                 verification.detail = detail;
@@ -161,7 +174,7 @@ assert sympy.simplify(f.subs(x, 30)) == 20
 assert sympy.simplify(f.subs(x, 40)) == 15
 "#,
         );
-        oracle.verify(&mut v);
+        oracle.verify(&mut v, "42", &[]);
         assert_eq!(v.verdict, "proved", "{}", v.detail);
     }
 
@@ -172,7 +185,7 @@ assert sympy.simplify(f.subs(x, 40)) == 15
             return;
         }
         let mut v = verification("numeric", "assert 2 + 2 == 5, 'key contradicted'");
-        oracle.verify(&mut v);
+        oracle.verify(&mut v, "42", &[]);
         assert_eq!(v.verdict, "disproved");
     }
 
@@ -189,7 +202,7 @@ assert sympy.simplify(f.subs(x, 40)) == 15
             "().__class__.__mro__",
         ] {
             let mut v = verification("numeric", script);
-            oracle.verify(&mut v);
+            oracle.verify(&mut v, "42", &[]);
             assert_eq!(v.verdict, "unsupported", "script escaped: {script}");
         }
     }
@@ -201,7 +214,7 @@ assert sympy.simplify(f.subs(x, 40)) == 15
             return;
         }
         let mut v = verification("numeric", "while True:\n    pass");
-        oracle.verify(&mut v);
+        oracle.verify(&mut v, "42", &[]);
         assert_eq!(v.verdict, "unsupported");
     }
 
@@ -209,7 +222,7 @@ assert sympy.simplify(f.subs(x, 40)) == 15
     fn declared_non_computable_items_are_not_run() {
         let oracle = oracle();
         let mut v = verification("none", "");
-        oracle.verify(&mut v);
+        oracle.verify(&mut v, "42", &[]);
         assert_eq!(v.verdict, "not_run");
     }
 }

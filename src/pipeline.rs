@@ -320,7 +320,17 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
             }
         }
         // Free, deterministic, local: run before any further paid validation.
-        tokio::task::block_in_place(|| job.oracle.verify(&mut item.verification));
+        let keyed_option = match item.question_type.as_str() {
+            "integer" | "decimal" => item.numeric_answer.clone(),
+            _ => item
+                .options
+                .get(item.answer_index as usize)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        tokio::task::block_in_place(|| {
+            job.oracle.verify(&mut item.verification, &keyed_option, &item.options)
+        });
         match item.verification.verdict.as_str() {
             "disproved" => {
                 record_rejection(
@@ -952,7 +962,7 @@ Composition rules:
 - Distractors: each wrong option is the terminus of a complete plausible reasoning chain diverging from the solution at exactly one step. The assigned move's tempting wrong branch is the best distractor. If two options can be discarded without touching the mechanism, the item is defective.
 
 Verification contract (this is checked by machine, write it with care):
-- If the keyed answer is computable, set verification_kind to "sympy" or "numeric" and write a self-contained Python script that (1) restates the item's givens as code, (2) derives the keyed quantity from first principles — it must NOT just restate the final number, (3) asserts the derived value matches the keyed option's value (use tolerances for decimals), and (4) where cheap, asserts at least one distractor value is NOT produced. Only sympy, math, cmath, fractions, decimal, itertools, functools, statistics imports are available. The script must raise AssertionError if the key were wrong.
+- If the keyed answer is computable, set verification_kind to "sympy" or "numeric" and write a self-contained Python script that (1) restates the item's givens as code, (2) derives the keyed quantity from first principles — it must NOT just restate the final number, (3) asserts the derived value equals the value expressed by the harness-provided constant KEYED_OPTION (the exact text of the keyed option; parse numbers or tuples out of it — NEVER declare your own options dict or letter map, the harness injects OPTIONS and KEYED_OPTION, and a private map that disagrees with the real option order has let wrong keys pass), and (4) where cheap, asserts at least one distractor value is NOT produced. Only sympy, math, cmath, fractions, decimal, itertools, functools, statistics imports are available. The script must raise AssertionError if the key were wrong.
 - If the item is genuinely conceptual with no computable key, set verification_kind "none" and an empty script; the item will then need independent blind agreement, which is a stricter fate — prefer computable keys whenever the move allows.
 
 Formatting (rendered by a LaTeX engine):
@@ -1327,12 +1337,41 @@ fn source_excerpt(source: &SourceDocument, attempt: usize, max_chars: usize) -> 
     text
 }
 
+/// A verification script that declares its own A/B/C/D map must agree
+/// with the item's real option order, or its proof is about different
+/// options than the learner sees.
+fn script_letter_map_matches(item: &CandidateQuestion) -> bool {
+    let script = &item.verification.script;
+    fn normalize(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '$' && *c != '\\')
+            .collect()
+    }
+    for (index, letter) in ["'A'", "'B'", "'C'", "'D'"].iter().enumerate() {
+        let Some(at) = script.find(&format!("{letter}:")) else { continue };
+        let value: String = script[at + letter.len() + 1..]
+            .chars()
+            .take_while(|c| *c != ',' && *c != '}')
+            .collect();
+        let Some(option) = item.options.get(index) else { continue };
+        let value = normalize(&value);
+        let option = normalize(option);
+        if !value.is_empty() && !option.contains(&value) && !value.contains(&option) {
+            return false;
+        }
+    }
+    true
+}
+
 fn local_gate(
     item: &CandidateQuestion,
     existing: &HashSet<String>,
 ) -> std::result::Result<String, String> {
     if item.options.len() != 4 {
         return Err("not exactly four options".into());
+    }
+    if !script_letter_map_matches(item) {
+        return Err("verification script letter map disagrees with the option order".into());
     }
     if item.answer_index > 3 {
         return Err("answer_index outside 0..3".into());
@@ -1800,6 +1839,20 @@ mod tests {
         });
         let parsed: BlindResult = serde_json::from_value(old_shape).expect("old shape loads");
         assert!(parsed.parse_issues.is_empty());
+    }
+
+    #[test]
+    fn misordered_script_letter_maps_are_rejected() {
+        let mut q = valid_item();
+        q.options = vec!["$(2,2)$".into(), "$(3,2)$".into(), "$(2,3)$".into(), "$(3,3)$".into()];
+        q.verification.script =
+            "options = {'A': (2, 2), 'B': (2, 3), 'C': (3, 2), 'D': (3, 3)}\nassert True".into();
+        let verdict = local_gate(&q, &HashSet::new());
+        assert!(matches!(verdict, Err(reason) if reason.contains("letter map")));
+        // An aligned map passes.
+        q.verification.script =
+            "options = {'A': (2, 2), 'B': (3, 2), 'C': (2, 3), 'D': (3, 3)}\nassert True".into();
+        assert!(local_gate(&q, &HashSet::new()).is_ok());
     }
 
     #[test]
