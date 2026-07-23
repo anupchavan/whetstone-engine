@@ -488,10 +488,15 @@ pub fn plan_assignments(
         let spec = rung(rung_number);
         for _ in 0..slots {
             let seed = &seeds[(offset + slot_index) % seeds.len().max(1)];
-            let compatible_moves: Vec<&AnalyticalMove> = MOVES
+            let mut compatible_moves: Vec<&AnalyticalMove> = MOVES
                 .iter()
                 .filter(|move_| move_compatible(move_, seed))
                 .collect();
+            // An empty compatibility set must never panic the planner's
+            // modulo; the full catalog is the safe degradation.
+            if compatible_moves.is_empty() {
+                compatible_moves = MOVES.iter().collect();
+            }
             let mut move_keys = Vec::with_capacity(spec.moves_per_item);
             for move_number in 0..spec.moves_per_item {
                 let index =
@@ -624,6 +629,25 @@ mod tests {
         for assignment in plan.iter().filter(|a| a.move_keys.len() == 2) {
             assert_ne!(assignment.move_keys[0], assignment.move_keys[1]);
         }
+    }
+
+    #[test]
+    fn procedure_move_keys_all_exist_in_the_catalog() {
+        for key in PROCEDURE_MOVE_KEYS {
+            assert!(find_move(key).is_some(), "unknown move key {key}");
+        }
+    }
+
+    #[test]
+    fn an_unmatchable_seed_still_gets_a_full_plan() {
+        // Defense in depth: even a seed whose kind matches nothing must not
+        // panic the planner's modulo arithmetic.
+        let mut seed = seeds(1).remove(0);
+        seed.source_kind = "procedure".into();
+        seed.skill = String::new();
+        let plan = plan_assignments(8, &[seed], "misc", "olympiad_studio", 0.5);
+        assert!(!plan.is_empty());
+        assert!(plan.iter().all(|assignment| !assignment.move_keys.is_empty()));
     }
 
     #[test]

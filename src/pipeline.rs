@@ -1230,35 +1230,21 @@ fn parse_candidate_batch(
             }),
         );
         let mut item: CandidateQuestion = serde_json::from_value(value)?;
-        if item.source_paths.is_empty()
-            || !item.source_paths.contains(&seed.source_path)
-            || item.source_paths.len() > 2
-            || item
-                .source_paths
-                .iter()
-                .any(|path| !source.note_paths.contains(path))
-        {
-            bail!(
-                "candidate {key} declared invalid source_paths {:?} for seed path {:?}",
-                item.source_paths,
-                seed.source_path
-            );
-        }
+        // Provenance and skill are DETERMINED by the assigned seed, so a
+        // sloppy author declaration is normalized, never fatal: the seed's
+        // path always leads, declared extras survive only when they name
+        // real envelope notes, and at most one extra note may be claimed.
         let declared_paths = std::mem::take(&mut item.source_paths);
         item.source_paths.push(seed.source_path.clone());
         item.source_paths.extend(
             declared_paths
                 .into_iter()
-                .filter(|path| path != &seed.source_path),
+                .filter(|path| path != &seed.source_path && source.note_paths.contains(path)),
         );
         item.source_paths.dedup();
+        item.source_paths.truncate(2);
         item.source_kind = seed.source_kind.clone();
-        if item.target_skill.trim() != seed.skill.trim() {
-            bail!(
-                "candidate {key} target_skill does not match assigned seed {}",
-                seed.seed_id
-            );
-        }
+        item.target_skill = seed.skill.clone();
         item.question_type = question_type;
         item.numeric_answer = numeric_answer;
         item.correct_indices = correct_indices;
@@ -2167,6 +2153,20 @@ mod tests {
         assert_eq!(batch.items[0].verification.kind, "numeric");
         assert_eq!(batch.items[0].verification.verdict, "not_run");
         assert_eq!(batch.items[0].difficulty.cue_visibility, "medium");
+        assert_eq!(batch.items[0].source_paths, ["note.pdf"]);
+        assert_eq!(batch.items[0].target_skill, seed().skill);
+    }
+
+    #[test]
+    fn sloppy_author_provenance_is_normalized_not_fatal() {
+        // A paraphrased target_skill or an invented extra path must cost
+        // nothing: both are determined by the assigned seed.
+        let mut value = authored_value("Sloppy declarations");
+        value["target_skill"] = json!("a paraphrase the author invented");
+        value["source_paths"] = json!(["invented/other.md"]);
+        let raw = json!({"items": {"item_1": value}});
+        let group = vec![assignment()];
+        let batch = parse_candidate_batch(raw, &group, &[seed()], &source(), 1, 0).unwrap();
         assert_eq!(batch.items[0].source_paths, ["note.pdf"]);
         assert_eq!(batch.items[0].target_skill, seed().skill);
     }
