@@ -51,7 +51,7 @@ const AUTHOR_CHUNK: usize = 5;
 /// Concurrent chunks in flight. Each chunk holds ≤2 concurrent calls during
 /// its probe+review stage, so total concurrency stays provider-friendly.
 const CHUNK_CONCURRENCY: usize = 4;
-const CACHE_VERSION: &str = "v11";
+const CACHE_VERSION: &str = "v12";
 const MAX_SEEDS: usize = 12;
 
 pub struct PipelineConfig {
@@ -385,6 +385,18 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
     let tag = format!("a{}c{}", job.attempt, job.chunk_index);
     let blind_label = format!("blind:{}:{tag}", job.source.name);
     let survivor_refs: Vec<&CandidateQuestion> = survivors.iter().collect();
+    // Stem-only solve first: its routes feed the reviewer's construct audit,
+    // so retrieval and recognition stop being conflated.
+    let routes: HashMap<String, OptionlessResult> = optionless_probe(
+        job.client,
+        job.config,
+        &survivor_refs,
+        &format!("optionless:{}:{tag}", job.source.name),
+        job.ledger,
+    )
+    .await
+    .map(|results| results.into_iter().map(|r| (r.item_id.clone(), r)).collect())
+    .unwrap_or_default();
     let (blind, review) = tokio::join!(
         blind_probe(
             job.client,
@@ -399,6 +411,7 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
             job.config,
             job.source,
             &survivors,
+            &routes,
             &tag,
             job.ledger,
         )
@@ -446,6 +459,47 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
             record_rejection(job.ledger, &job.source.sha256, "reviewer omitted item".into());
             continue;
         };
+        let mut review = review.clone();
+        // Weak distractors get ONE bounded repair (stem, key, and solution
+        // frozen) and a single re-review. Oracle-proved items skip repair:
+        // their verification scripts reference the recorded option order.
+        if !review.distractor_independence && item.verification.verdict != "proved" {
+            if let Ok(Some((options, rationales))) =
+                repair_distractors(&job, &item, &review.reason).await
+            {
+                item.options = options;
+                item.distractor_rationales = rationales;
+                let solo_routes: HashMap<String, OptionlessResult> = routes
+                    .get(&item.id)
+                    .cloned()
+                    .map(|r| HashMap::from([(item.id.clone(), r)]))
+                    .unwrap_or_default();
+                if let Ok(rechecked) = grounded_review(
+                    job.client,
+                    job.config,
+                    job.source,
+                    std::slice::from_ref(&item),
+                    &solo_routes,
+                    &format!("{tag}r"),
+                    job.ledger,
+                )
+                .await
+                {
+                    if let Some(fresh) = rechecked.into_iter().next() {
+                        review = fresh;
+                    }
+                }
+            }
+            if !review.distractor_independence && item.moves.rung >= 3 {
+                record_rejection(
+                    job.ledger,
+                    &job.source.sha256,
+                    "distractors collapse under one elimination; repair failed".into(),
+                );
+                continue;
+            }
+        }
+        let review = &review;
         let solver_correct = blind.solvable && solver_agrees(&item, blind);
         item.validation.blind_answer_index =
             Some(if solver_correct { item.answer_index } else { blind.answer_index });
@@ -458,10 +512,11 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
             && (item.moves.rung < 3 || review.essential_inferences >= 2);
         item.difficulty.essential_inferences = review.essential_inferences;
         // Accepting a question and trusting it as mastery evidence are two
-        // separate decisions: leakage or a generic-reasoning bypass keeps
-        // the item (it may still be a fine warm-up) but downgrades its
-        // delivered rung and its weight in the learner model.
-        let compromised = review.stem_leakage || !blind.used_target_skill;
+        // separate decisions: leakage or a stem-only bypass keeps the item
+        // (it may still be a fine warm-up) but downgrades its delivered
+        // rung and its weight in the learner model. An unresolved blind
+        // issue or surviving distractor weakness dampens evidence too.
+        let compromised = review.stem_leakage || review.skill_bypassed;
         item.validated_rung = if compromised {
             1
         } else if review.essential_inferences < 2 {
@@ -469,12 +524,22 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
         } else {
             item.moves.rung
         };
-        let weight = if (0.0..=1.0).contains(&review.mastery_weight) {
+        let mut weight = if (0.0..=1.0).contains(&review.mastery_weight) {
             review.mastery_weight
         } else {
             1.0
         };
-        item.mastery_weight = if compromised { weight.min(0.35) } else { weight };
+        if compromised {
+            weight = weight.min(0.35);
+        }
+        if !blind.issue.trim().is_empty() {
+            item.validated_rung = item.validated_rung.min(2);
+            weight = weight.min(0.6);
+        }
+        if !review.distractor_independence {
+            weight = weight.min(0.5);
+        }
+        item.mastery_weight = weight;
         item.pedagogical_role = if compromised {
             "enrichment".into()
         } else {
@@ -492,10 +557,14 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
 
         let proved = item.verification.verdict == "proved";
         let key_evidence = proved || (solver_correct && blind.confidence >= 0.65);
+        // The reviewer's own overall verdict is consumed, not just its
+        // per-dimension booleans: accept=false is a rejection even when
+        // every individual gate happens to read true.
         let review_pass = item.validation.fidelity_gate
             && item.validation.construct_gate
             && item.validation.presentation_gate
-            && item.validation.novelty_gate;
+            && item.validation.novelty_gate
+            && review.accept;
 
         // Clarity gate: the blind solver doubles as a source-free reader.
         // A stem it could not parse in one read is defective even when the
@@ -601,6 +670,86 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
 /// blind reader's parse issues while freezing every load-bearing part
 /// (values, structure, options, key, solution). Returns the revised stem
 /// plus a fresh blind reading of it, or None when the model cannot comply.
+/// Bounded distractor-only repair: the stem, correct option, and solution
+/// are frozen; only the wrong options are rewritten, each around a distinct
+/// misconception. Returns the full rebuilt option array plus rationales.
+async fn repair_distractors(
+    job: &ChunkJob<'_>,
+    item: &CandidateQuestion,
+    reason: &str,
+) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    let key_index = item.answer_index as usize;
+    let Some(key_text) = item.options.get(key_index) else {
+        return Ok(None);
+    };
+    let task = format!(
+        "This question's wrong options collapse under one generic elimination or share a misconception. Write exactly three NEW wrong options. FREEZE everything else: the stem, the correct option, and the solution are untouched, and each new option must be wrong under the frozen stem. Each option embodies a DISTINCT plausible misconception about the material, matches the correct option's form and length, and none may be rejectable by a superficial observation that also rejects the others. Give each option's misconception rationale in one clause.\nREVIEWER REASON: {reason}\nSTEM: {stem}\nCORRECT OPTION (frozen): {key}\nCURRENT WRONG OPTIONS: {wrong:?}",
+        stem = item.stem,
+        key = key_text,
+        wrong = item
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != key_index)
+            .map(|(_, o)| o.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let raw: Value = job
+        .client
+        .call_json(
+            MessageSpec {
+                model: &job.config.validator_model,
+                system: FACTORY_SYSTEM,
+                content: vec![json!({"type": "text", "text": task})],
+                schema: json!({
+                    "type": "object", "additionalProperties": false,
+                    "properties": {"distractors": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {"text": {"type": "string"}, "rationale": {"type": "string"}},
+                        "required": ["text", "rationale"]
+                    }}},
+                    "required": ["distractors"]
+                }),
+                max_tokens: 2_000,
+                phase: &format!("distractor-repair:{}", item.id),
+                source_hash: Some(&job.source.sha256),
+                effort: Some("low"),
+            },
+            job.ledger,
+        )
+        .await?;
+    let fresh: Vec<(String, String)> = raw
+        .get("distractors")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|d| {
+                    Some((
+                        d.get("text")?.as_str()?.trim().to_owned(),
+                        d.get("rationale")?.as_str()?.trim().to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fresh.len() != 3 || fresh.iter().any(|(text, _)| text.is_empty() || text == key_text) {
+        return Ok(None);
+    }
+    let mut options = Vec::with_capacity(4);
+    let mut rationales = Vec::with_capacity(4);
+    let mut next = fresh.into_iter();
+    for index in 0..item.options.len() {
+        if index == key_index {
+            options.push(key_text.clone());
+            rationales.push("correct".into());
+        } else if let Some((text, rationale)) = next.next() {
+            options.push(text);
+            rationales.push(rationale);
+        }
+    }
+    Ok(Some((options, rationales)))
+}
+
 async fn repair_wording(
     job: &ChunkJob<'_>,
     item: &CandidateQuestion,
@@ -1055,7 +1204,7 @@ fn author_prompt(
         .collect();
     let any_bridge = group.iter().any(|a| a.bridge);
     Ok(format!(
-        r#"AUTHORING ROLE. A registered source envelope precedes this instruction. You will compose exactly {count} original single-select four-option questions from ASSIGNED COMPOSITIONS, one per item slot.
+        r#"AUTHORING ROLE. A registered source envelope precedes this instruction. You will compose exactly {count} original questions from ASSIGNED COMPOSITIONS, one per item slot — single-select four-option by default; the later type rules for multi, integer, and decimal items apply when the composition calls for them.
 
 SEEDS (source-grounded starting points):
 {seeds}
@@ -1341,10 +1490,10 @@ async fn blind_probe(
 ) -> Result<Vec<BlindResult>> {
     let payload: Vec<Value> = candidates
         .iter()
-        .map(|q| json!({"item_id": q.id, "type": q.question_type, "stem": q.stem, "options": q.options, "target_skill": q.target_skill}))
+        .map(|q| json!({"item_id": q.id, "type": q.question_type, "stem": q.stem, "options": q.options}))
         .collect();
     let task = format!(
-        "Act as a blind correctness solver. Solve each problem independently and honestly. You have not received the author's key, solution, or source. Each item declares target_skill: the ability its author claims it measures — this is a claim to AUDIT, not a hint. After solving, report used_target_skill (did YOUR honest route genuinely require that skill?) and bypass_route: when generic reasoning (entailment from the stem, elimination, arithmetic) suffices without the skill, name that route in one clause, else leave it empty. FIRST, for each item, read only its stem and options and report in parse_issues anything you cannot pin down from the text alone: an undefined object (\"search in WHAT structure?\"), an unanchored scenario term (\"launch of WHAT?\"), an ambiguous quantifier, or an unclear asked quantity. parse_issues stays an empty string when every sentence parses in one read; needing to THINK to solve is not a parse issue, and do not report standard terms of the subject as issues. Then solve anyway under the most reasonable reading. Per item by type: mcq — choose answer_index 0..3 and leave answer_text empty; multi — set answer_text to ALL correct letters concatenated (e.g. \"AC\") and answer_index to the first; integer/decimal — put the numeric value in answer_text and set answer_index 0. Say whether each is unambiguously solvable, give calibrated confidence 0..1, and state any issue. Do not infer keys from option patterns. ITEMS:\n{}",
+        "Act as a blind correctness solver. Solve each problem independently and honestly. You have not received the author's key, solution, or source. FIRST, for each item, read only its stem and options and report in parse_issues anything you cannot pin down from the text alone: an undefined object (\"search in WHAT structure?\"), an unanchored scenario term (\"launch of WHAT?\"), an ambiguous quantifier, or an unclear asked quantity. parse_issues stays an empty string when every sentence parses in one read; needing to THINK to solve is not a parse issue, and do not report standard terms of the subject as issues. Then solve anyway under the most reasonable reading. Per item by type: mcq — choose answer_index 0..3 and leave answer_text empty; multi — set answer_text to ALL correct letters concatenated (e.g. \"AC\") and answer_index to the first; integer/decimal — put the numeric value in answer_text and set answer_index 0. Say whether each is unambiguously solvable, give calibrated confidence 0..1, and state any issue. Do not infer keys from option patterns. ITEMS:\n{}",
         serde_json::to_string(&payload)?
     );
     // Reasoning tokens count against max_tokens; a hard batch can burn the
@@ -1382,11 +1531,60 @@ async fn blind_probe(
 // Phase D: grounded review
 // ---------------------------------------------------------------------------
 
+/// One stem-only solve per chunk: no options to eliminate against, no skill
+/// label to lean on. The recorded route is what the reviewer audits with.
+async fn optionless_probe(
+    client: &AnthropicClient,
+    config: &PipelineConfig,
+    candidates: &[&CandidateQuestion],
+    label: &str,
+    ledger: &Mutex<JobLedger>,
+) -> Result<Vec<OptionlessResult>> {
+    let payload: Vec<Value> = candidates
+        .iter()
+        .map(|q| json!({"item_id": q.id, "stem": q.stem}))
+        .collect();
+    let task = format!(
+        "Act as a stem-only solver. Each item gives ONLY a problem stem: no answer options exist and none will be shown. Solve each honestly from the stem alone. Report answer_text (your answer as a value or one-clause claim), route (ONE clause naming the reasoning route you actually used, e.g. 'direct entailment from the stated layers', 'two-pointer sweep over the events', 'geometric series domination'), and calibrated confidence 0..1. If a stem is unanswerable without options, say so in answer_text and give the route you attempted. ITEMS:\n{}",
+        serde_json::to_string(&payload)?
+    );
+    let cap = (candidates.len() as u32 * 1_000).clamp(4_000, 12_000);
+    let raw: Value = client
+        .call_json(
+            MessageSpec {
+                model: &config.validator_model,
+                system: FACTORY_SYSTEM,
+                content: vec![json!({"type": "text", "text": task})],
+                schema: optionless_schema(candidates.len()),
+                max_tokens: cap,
+                phase: label,
+                source_hash: None,
+                effort: Some("low"),
+            },
+            ledger,
+        )
+        .await?;
+    parse_fixed_items(raw, candidates.len(), "optionless solver")
+}
+
+fn optionless_schema(count: usize) -> Value {
+    fixed_batch_schema(
+        count,
+        json!({
+            "type": "object", "additionalProperties": false, "properties": {
+                "item_id": {"type": "string"}, "answer_text": {"type": "string"},
+                "route": {"type": "string"}, "confidence": {"type": "number"}
+            }, "required": ["item_id", "answer_text", "route", "confidence"]
+        }),
+    )
+}
+
 async fn grounded_review(
     client: &AnthropicClient,
     config: &PipelineConfig,
     source: &SourceDocument,
     candidates: &[CandidateQuestion],
+    routes: &HashMap<String, OptionlessResult>,
     tag: &str,
     ledger: &Mutex<JobLedger>,
 ) -> Result<Vec<ReviewResult>> {
@@ -1405,12 +1603,15 @@ async fn grounded_review(
                 "author_essential_inferences": q.difficulty.essential_inferences,
                 "distractor_rationales": q.distractor_rationales,
                 "evidence": q.evidence, "rung": q.moves.rung,
-                "oracle_verdict": q.verification.verdict
+                "oracle_verdict": q.verification.verdict,
+                // Stem-only solve, recorded blind to options and skill label.
+                "blind_route": routes.get(&q.id).map(|r| r.route.clone()).unwrap_or_default(),
+                "blind_answer_text": routes.get(&q.id).map(|r| r.answer_text.clone()).unwrap_or_default()
             })
         })
         .collect();
     let task = format!(
-        "Act as an independent grounded fidelity, construct, presentation, and novelty reviewer. The registered source envelope precedes this instruction. For each candidate: verify every tested premise and the key are supported by or validly derived from the envelope plus elementary prerequisites; check the worked solution for errors; reject copied or near-paraphrased source exercises; reject ambiguity, hidden conventions, cues that give the answer away, or distractors that are not genuinely plausible. Set presentation=false when code, shell text, or filenames appear inside math delimiters or \texttt instead of backtick inline code (a stray $ from code text breaks rendering), when a program-level expression uses LaTeX operators or spacing (\\leftarrow, \\&, \\,) instead of plain backtick code, or when the same symbol switches notation between mentions (math $X$ in the stem but plain X or `X` in an option). Set presentation=false for any stem that is not SELF-CONTAINED: if it references data, objects, quantities, or procedures that are only defined in the source (e.g. counts of an unstated thing, rows of an unstated structure, \"the process\" without saying which), the learner cannot even parse the question — the full setup must live in the stem, only the solution route may be hidden. Also set presentation=false when the stem coins or imports a compressed term (\"k-jump scan\", \"absent target\") without a one-clause gloss at first use — a learner who knows the topic must parse every phrase in one read; terms the source itself teaches need no gloss. Reject silently mixed time/unit representations. Items marked oracle_verdict=proved have machine-verified keys — do not second-guess the key itself, focus on fidelity, clarity, and construct. novelty=false means the item is routine formula substitution or recall; note that rung 1–2 items are ALLOWED to be standard applications (novelty is only enforced upstream for rung ≥ 3), so still report novelty honestly but judge construct_quality on fairness and correctness, not on brilliance. CONSTRUCT LITMUS: validate target_skill/where_used/why_necessary and set construct_quality=false if the claimed source skill is not load-bearing. Decisive counterfactual: remove the creative twist, or assume its preprocessing is already done; if the learner no longer needs the source technique, reject. Also reject when any prominent condition is inert—removing it changes neither answer, algorithmic decision, nor plausible distractor. A stated tie rule needs a real tie. For procedure seeds at rung ≥3 reject tiny inspectable instances, failure to execute the technique, unrelated preprocessing as the main work, or no invariant/pointer choice/boundary/complexity decision. Return essential_inferences as the confirmed number of dependent reasoning steps; fewer than two cannot pass rung ≥3. Report stem_leakage=true when the stem states the very fact the item claims to test, so the learner repeats rather than retrieves — including any MUST-be-true item whose key is the only stem-entailed statement while every distractor merely adds an unsupported detail (that tests textual entailment, not the subject). Report distractor_independence=false when two or more distractors fall to one generic elimination; each distractor should embody a DISTINCT misconception about the source material. Report assessment_level (recall|understanding|application|transfer) for what the item actually demands, and mastery_weight 0..1: how strongly a correct answer evidences the declared target_skill (leaked or bypassable items rate low; items where the skill is the decisive bottleneck rate high). Set accept=true only when every applicable boolean gate is true. Keep each reason under 240 characters. CANDIDATES:\n{}",
+        "Act as an independent grounded fidelity, construct, presentation, and novelty reviewer. The registered source envelope precedes this instruction. For each candidate: verify every tested premise and the key are supported by or validly derived from the envelope plus elementary prerequisites; check the worked solution for errors; reject copied or near-paraphrased source exercises; reject ambiguity, hidden conventions, cues that give the answer away, or distractors that are not genuinely plausible. Set presentation=false when code, shell text, or filenames appear inside math delimiters or \texttt instead of backtick inline code (a stray $ from code text breaks rendering), when a program-level expression uses LaTeX operators or spacing (\\leftarrow, \\&, \\,) instead of plain backtick code, or when the same symbol switches notation between mentions (math $X$ in the stem but plain X or `X` in an option). Set presentation=false for any stem that is not SELF-CONTAINED: if it references data, objects, quantities, or procedures that are only defined in the source (e.g. counts of an unstated thing, rows of an unstated structure, \"the process\" without saying which), the learner cannot even parse the question — the full setup must live in the stem, only the solution route may be hidden. Also set presentation=false when the stem coins or imports a compressed term (\"k-jump scan\", \"absent target\") without a one-clause gloss at first use — a learner who knows the topic must parse every phrase in one read; terms the source itself teaches need no gloss. Reject silently mixed time/unit representations. Items marked oracle_verdict=proved have machine-verified keys — do not second-guess the key itself, focus on fidelity, clarity, and construct. novelty=false means the item is routine formula substitution or recall; note that rung 1–2 items are ALLOWED to be standard applications (novelty is only enforced upstream for rung ≥ 3), so still report novelty honestly but judge construct_quality on fairness and correctness, not on brilliance. CONSTRUCT LITMUS: validate target_skill/where_used/why_necessary and set construct_quality=false if the claimed source skill is not load-bearing. Decisive counterfactual: remove the creative twist, or assume its preprocessing is already done; if the learner no longer needs the source technique, reject. Each candidate carries blind_route and blind_answer_text: a solver's stem-only solution, recorded WITHOUT seeing the options or any skill label. Set skill_bypassed=true when that route (or plain option elimination) reaches the key without exercising target_skill. PROVENANCE: every decisive inference must be covered by the source, the stem itself, or a genuine learner-level prerequisite — a language- or domain-specific edge rule YOU happen to know is NOT an ordinary prerequisite; if such a rule is decisive and neither sourced nor stated, set fidelity=false. LOST FUNCTIONS: for any item that removes, substitutes, or declares redundant a component, list every function the source attributes to that component; the keyed condition must neutralize ALL of them — a sufficiency claim covering only one documented function fails correctness, and wording like 'actually valid' may not exceed the source's simplified model. LEMMAS: verify each quantitative claim inside the worked solution (bounds, off-by-one counts, case splits) — a correct final key does not validate intermediate lemmas, and a false lemma fails correctness. CAPABILITY: ask what capability emphasized by the source a correct answer demonstrates; if the honest answer is only 'evaluated one small input', cap assessment_level at understanding unless the source section is chiefly procedural execution. Also reject when any prominent condition is inert—removing it changes neither answer, algorithmic decision, nor plausible distractor. A stated tie rule needs a real tie. For procedure seeds at rung ≥3 reject tiny inspectable instances, failure to execute the technique, unrelated preprocessing as the main work, or no invariant/pointer choice/boundary/complexity decision. Return essential_inferences as the confirmed number of dependent reasoning steps; fewer than two cannot pass rung ≥3. Report stem_leakage=true when the stem states the very fact the item claims to test, so the learner repeats rather than retrieves — including any MUST-be-true item whose key is the only stem-entailed statement while every distractor merely adds an unsupported detail (that tests textual entailment, not the subject). Report distractor_independence=false when two or more distractors fall to one generic elimination; each distractor should embody a DISTINCT misconception about the source material. Report assessment_level (recall|understanding|application|transfer) for what the item actually demands, and mastery_weight 0..1: how strongly a correct answer evidences the declared target_skill (leaked or bypassable items rate low; items where the skill is the decisive bottleneck rate high). Set accept=true only when every applicable boolean gate is true. Keep each reason under 240 characters. CANDIDATES:\n{}",
         serde_json::to_string(&payload)?
     );
     let mut cap = (candidates.len() as u32 * 800).clamp(6_000, 12_000);
@@ -1428,7 +1629,10 @@ async fn grounded_review(
                     max_tokens: cap,
                     phase: &format!("review:{}:{tag}", source.name),
                     source_hash: Some(&source.sha256),
-                    effort: Some("low"),
+                    // The grounded review is the primary protection for
+                    // non-computable claims; low effort was too cheap for
+                    // that responsibility.
+                    effort: Some("medium"),
                 },
                 ledger,
             )
@@ -1908,9 +2112,8 @@ fn blind_schema(count: usize) -> Value {
                 "item_id": {"type": "string"}, "answer_index": {"type": "integer"}, "answer_text": {"type": "string"},
                 "solvable": {"type": "boolean"},
                 "confidence": {"type": "number"}, "issue": {"type": "string"},
-                "parse_issues": {"type": "string"},
-                "used_target_skill": {"type": "boolean"}, "bypass_route": {"type": "string"}
-            }, "required": ["item_id", "answer_index", "answer_text", "solvable", "confidence", "issue", "parse_issues", "used_target_skill", "bypass_route"]
+                "parse_issues": {"type": "string"}
+            }, "required": ["item_id", "answer_index", "answer_text", "solvable", "confidence", "issue", "parse_issues"]
         }),
     )
 }
@@ -1923,11 +2126,12 @@ fn review_schema(count: usize) -> Value {
                     "item_id": {"type": "string"}, "fidelity": {"type": "boolean"}, "correctness": {"type": "boolean"},
                     "construct_quality": {"type": "boolean"}, "presentation": {"type": "boolean"}, "novelty": {"type": "boolean"},
                     "diagram_consistent": {"type": "boolean"}, "essential_inferences": {"type": "integer"},
-                    "stem_leakage": {"type": "boolean"}, "distractor_independence": {"type": "boolean"},
+                    "stem_leakage": {"type": "boolean"}, "skill_bypassed": {"type": "boolean"},
+                    "distractor_independence": {"type": "boolean"},
                     "assessment_level": {"type": "string", "enum": ["recall", "understanding", "application", "transfer"]},
                     "mastery_weight": {"type": "number"},
                     "accept": {"type": "boolean"}, "reason": {"type": "string"}
-                }, "required": ["item_id", "fidelity", "correctness", "construct_quality", "presentation", "novelty", "diagram_consistent", "essential_inferences", "stem_leakage", "distractor_independence", "assessment_level", "mastery_weight", "accept", "reason"]
+                }, "required": ["item_id", "fidelity", "correctness", "construct_quality", "presentation", "novelty", "diagram_consistent", "essential_inferences", "stem_leakage", "skill_bypassed", "distractor_independence", "assessment_level", "mastery_weight", "accept", "reason"]
         }),
     )
 }

@@ -185,7 +185,13 @@ pub fn classify_domain(name: &str, text: &str) -> String {
         ),
         (
             "computer-science",
-            &["algorithm", "program", "complexity", "data structure"],
+            &[
+                "algorithm", "program", "complexity", "data structure",
+                // Networking vocabulary: these notes classified as
+                // "general" because no group claimed them.
+                "network", "ethernet", "duplex", "router", "protocol",
+                "bandwidth", "packet", "cable", "transmission",
+            ],
         ),
         ("biology", &["biology", "cell", "organism", "genetics"]),
     ];

@@ -251,14 +251,25 @@ pub struct BlindResult {
     /// when the stem parses in one read.
     #[serde(default)]
     pub parse_issues: String,
-    /// Whether the solver's honest route genuinely needed the declared
-    /// target skill. Defaults true so legacy probes carry no penalty.
+    /// Legacy fields from when the with-options solver audited the declared
+    /// skill itself; the audit now belongs to the reviewer, fed by the
+    /// optionless solve's route. Kept for old cached probes.
     #[serde(default = "default_true")]
     pub used_target_skill: bool,
-    /// The generic-reasoning route that suffices without the target skill;
-    /// empty when none exists.
     #[serde(default)]
     pub bypass_route: String,
+}
+
+/// A stem-only solve: no options, no declared skill, nothing to eliminate
+/// against. Its route is what the reviewer audits the construct with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionlessResult {
+    pub item_id: String,
+    /// The solver's answer as free text (value, claim, or choice content).
+    pub answer_text: String,
+    /// One clause naming the reasoning route actually used.
+    pub route: String,
+    pub confidence: f64,
 }
 
 fn default_true() -> bool {
@@ -284,6 +295,10 @@ pub struct ReviewResult {
     /// The stem states the very fact the item claims to test.
     #[serde(default)]
     pub stem_leakage: bool,
+    /// The optionless route (or plain elimination) reaches the key without
+    /// exercising the declared target skill.
+    #[serde(default)]
+    pub skill_bypassed: bool,
     /// False when two or more distractors fall to one generic elimination.
     #[serde(default = "default_true")]
     pub distractor_independence: bool,
