@@ -11,6 +11,9 @@ pub enum SourcePayload {
 pub struct SourceDocument {
     pub path: PathBuf,
     pub name: String,
+    /// Exact note paths represented by this source envelope. Sidecar sources
+    /// use vault-relative paths; standalone CLI sources use their input path.
+    pub note_paths: Vec<String>,
     pub media_type: String,
     pub sha256: String,
     pub extracted_text: String,
@@ -59,6 +62,18 @@ pub struct SeedProblem {
     /// The seed's own answer/conclusion when the source states one.
     pub known_answer: String,
     pub locator: String,
+    /// Exact path from the envelope's `# Note:` header (or the sole source).
+    #[serde(default)]
+    pub source_path: String,
+    /// The concrete source-taught ability this seed can certify.
+    #[serde(default)]
+    pub skill: String,
+    /// procedure | concept | representation
+    #[serde(default)]
+    pub source_kind: String,
+    /// Empty when normalized; otherwise the source's unit/time ambiguity.
+    #[serde(default)]
+    pub representation_ambiguity: String,
 }
 
 /// The move composition the orchestrator assigned to an item slot. The author
@@ -156,6 +171,19 @@ pub struct CandidateQuestion {
     pub answer_index: u8,
     pub worked_solution: String,
     pub decisive_insight: String,
+    /// Machine-readable construct claims authored and grounded-reviewed.
+    #[serde(default)]
+    pub target_skill: String,
+    #[serde(default)]
+    pub where_used: String,
+    #[serde(default)]
+    pub why_necessary: String,
+    /// Exact load-bearing note paths. Empty only on legacy cache entries.
+    #[serde(default)]
+    pub source_paths: Vec<String>,
+    /// Source classification copied from the assigned seed.
+    #[serde(default)]
+    pub source_kind: String,
     pub distractor_rationales: Vec<String>,
     pub evidence: Vec<EvidenceRef>,
     pub difficulty: DifficultyFeatures,
@@ -223,6 +251,9 @@ pub struct ReviewResult {
     pub presentation: bool,
     pub novelty: bool,
     pub diagram_consistent: bool,
+    /// Reviewer's confirmed count of dependent reasoning steps.
+    #[serde(default)]
+    pub essential_inferences: u8,
     pub accept: bool,
     pub reason: String,
 }

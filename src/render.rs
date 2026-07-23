@@ -190,6 +190,11 @@ mod tests {
             answer_index: 0,
             worked_solution: "Because.".into(),
             decisive_insight: "Perspective.".into(),
+            target_skill: String::new(),
+            where_used: String::new(),
+            why_necessary: String::new(),
+            source_paths: vec![],
+            source_kind: String::new(),
             distractor_rationales: vec!["ok".into(); 4],
             evidence: vec![EvidenceRef {
                 locator: "p. 1".into(),

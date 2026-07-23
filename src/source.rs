@@ -102,9 +102,11 @@ fn load_source(path: PathBuf) -> Result<SourceDocument> {
     // notes into a combined envelope so atomic vaults stay selectable).
     let _ = extracted_chars;
     let domain = classify_domain(&name, &extracted_text);
+    let note_path = path.to_string_lossy().to_string();
     Ok(SourceDocument {
         path,
         name,
+        note_paths: vec![note_path],
         media_type,
         sha256,
         extracted_text,
@@ -241,6 +243,7 @@ mod tests {
         let mk = |hash: &str| SourceDocument {
             path: hash.into(),
             name: hash.into(),
+            note_paths: vec![hash.into()],
             media_type: "text/plain".into(),
             sha256: hash.into(),
             extracted_text: "text".into(),

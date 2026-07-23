@@ -1198,7 +1198,10 @@ fn compose_envelopes(
         if native_pdf
             || (!combine_all && source.extracted_text.trim().chars().count() >= SOLO_MIN_CHARS)
         {
-            rel_by_hash.insert(source.sha256.clone(), vec![rel_of(&source)]);
+            let rel = rel_of(&source);
+            rel_by_hash.insert(source.sha256.clone(), vec![rel.clone()]);
+            let mut source = source;
+            source.note_paths = vec![rel];
             sources.push(source);
         } else {
             // combine_all (daily practice) throws every note into ONE pool
@@ -1246,6 +1249,7 @@ fn compose_envelopes(
             sources.push(SourceDocument {
                 path: root.join(&name),
                 name,
+                note_paths: rel_by_hash.get(&sha256).cloned().unwrap_or_default(),
                 media_type: "text/plain".into(),
                 sha256,
                 extracted_text: text.clone(),
@@ -1411,6 +1415,11 @@ fn question_set(
     });
     let items = items;
     let questions: Vec<Value> = items.iter().map(|item| {
+        let source_paths = item_source_paths(item, rel_by_hash);
+        let source_path = source_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| item.source_name.clone());
         let difficulty = match item.moves.rung {
             1 => "easy",
             2 => "medium",
@@ -1452,7 +1461,9 @@ fn question_set(
             "explanation": explanation.trim(),
             "correct_answer": correct_answer,
             "correct_answers": correct_answers,
-            "source_title": note_title(&item.source_name),
+            "source_title": note_title(&source_path),
+            "source_path": source_path,
+            "source_paths": source_paths,
             "difficulty": difficulty,
             "rating": item.elo.as_ref().map(|state| state.rating),
             "figure_svg": item.diagram_svg,
@@ -1465,10 +1476,7 @@ fn question_set(
     let item_source_paths: BTreeMap<String, Vec<String>> = items
         .iter()
         .map(|item| {
-            let rels = rel_by_hash
-                .get(&item.source_hash)
-                .cloned()
-                .unwrap_or_else(|| vec![item.source_name.clone()]);
+            let rels = item_source_paths(item, rel_by_hash);
             (item.id.clone(), rels)
         })
         .collect();
@@ -1489,6 +1497,21 @@ fn question_set(
             "warnings": []
         }
     })
+}
+
+fn item_source_paths(
+    item: &CandidateQuestion,
+    rel_by_hash: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    if !item.source_paths.is_empty() {
+        return item.source_paths.clone();
+    }
+    // Compatibility for accepted inventory/cache entries written before
+    // item-level provenance existed.
+    rel_by_hash
+        .get(&item.source_hash)
+        .cloned()
+        .unwrap_or_else(|| vec![item.source_name.clone()])
 }
 
 /// A mid-generation snapshot of the pool: same shape, marked with the true
@@ -1646,7 +1669,7 @@ fn append_jsonl(path: &Path, line: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{humanize_error, question_set_partial};
+    use super::{humanize_error, question_set, question_set_partial};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1661,6 +1684,45 @@ mod tests {
         let set = question_set_partial("job", &items, &BTreeMap::new(), 10);
         let served = set["questions"].as_array().expect("questions array");
         assert_eq!(served.len(), 10, "surplus inventory must not ride along");
+    }
+
+    #[test]
+    fn delivered_mapping_prefers_item_provenance_over_group_envelope() {
+        let mut item = crate::model::CandidateQuestion::default();
+        item.id = "q1".into();
+        item.source_name = "6 notes (grouped)".into();
+        item.source_hash = "bundle".into();
+        item.source_paths = vec!["algorithms/interval-sweep.md".into()];
+        let rels = BTreeMap::from([(
+            "bundle".into(),
+            vec![
+                "algorithms/interval-sweep.md".into(),
+                "physics/measurement.md".into(),
+            ],
+        )]);
+
+        let set = question_set("job", &[item], &rels);
+        assert_eq!(
+            set["generation_manifest"]["item_source_paths"]["q1"],
+            serde_json::json!(["algorithms/interval-sweep.md"])
+        );
+        assert_eq!(set["questions"][0]["source_title"], "interval-sweep");
+        assert_eq!(
+            set["questions"][0]["source_path"],
+            "algorithms/interval-sweep.md"
+        );
+
+        let mut legacy = crate::model::CandidateQuestion::default();
+        legacy.id = "old".into();
+        legacy.source_hash = "bundle".into();
+        let legacy_set = question_set("legacy", &[legacy], &rels);
+        assert_eq!(
+            legacy_set["generation_manifest"]["item_source_paths"]["old"],
+            serde_json::json!([
+                "algorithms/interval-sweep.md",
+                "physics/measurement.md"
+            ])
+        );
     }
 
     #[test]

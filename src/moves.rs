@@ -204,39 +204,150 @@ pub const MOVES: &[AnalyticalMove] = &[
 /// object", "the mirror itself moves".
 pub struct SetupMutation {
     pub key: &'static str,
+    /// What seed feature makes this world-change meaningful.
+    pub trigger: &'static str,
+    /// Seed kinds on which this mutation is normally valid.
+    pub compatible_source_kinds: &'static [&'static str],
+    /// Terms in the seed's certified skill/givens that evidence the trigger.
+    pub seed_triggers: &'static [&'static str],
+    /// A procedure seed additionally needs one of these skill phrases.
+    pub procedure_skill_triggers: &'static [&'static str],
     pub instruction: &'static str,
 }
 
 pub const MUTATIONS: &[SetupMutation] = &[
     SetupMutation {
         key: "heterogenize",
+        trigger: "the taught result assumes uniform data, spacing, material, rate, or regime",
+        compatible_source_kinds: &["concept", "representation", "procedure"],
+        seed_triggers: &["uniform", "homogeneous", "density", "spacing", "constant rate", "regime", "distribution"],
+        procedure_skill_triggers: &["bucket", "partition", "distribution", "varying", "non-uniform", "nonuniform"],
         instruction: "Make non-uniform a property the standard setup silently holds uniform (material, density, spacing, rate, composition): split it into two or more regions/regimes and ask for the observable consequence — the answer must expose WHY the standard result depended on uniformity.",
     },
     SetupMutation {
         key: "extend-object",
+        trigger: "the standard treatment acts on a point, instant, or atomic input",
+        compatible_source_kinds: &["concept", "representation", "procedure"],
+        seed_triggers: &["point", "instant", "particle", "interval", "range", "window", "sequence", "array", "stream"],
+        procedure_skill_triggers: &["interval", "range", "window", "sequence", "array", "stream"],
         instruction: "Replace the pointlike/instantaneous subject of the standard law with an extended or structured one (a rod, a distribution, an interval, a population), so the law must be applied per-part and the question extracts a geometric/aggregate property of the result.",
     },
     SetupMutation {
         key: "set-in-motion",
+        trigger: "a normally fixed input, boundary, ordering, or rate can change during execution",
+        compatible_source_kinds: &["concept", "representation", "procedure"],
+        seed_triggers: &["fixed", "static", "stationary", "event", "stream", "offline", "online", "dynamic", "time", "rate"],
+        procedure_skill_triggers: &["event", "stream", "offline", "online", "dynamic", "insertion", "cancellation", "ordering"],
         instruction: "Let something the standard treatment holds fixed change in time (the object, the apparatus, a boundary, a rate): the answer requires combining the topic's own transformation law with rate/vector reasoning.",
     },
     SetupMutation {
         key: "duplicate-couple",
+        trigger: "two compatible instances can be composed and their interaction changes the result",
+        compatible_source_kinds: &["concept", "representation", "procedure"],
+        seed_triggers: &["device", "component", "series", "parallel", "compose", "merge", "two-pointer", "two pointer", "pipeline"],
+        procedure_skill_triggers: &["merge", "compose", "pipeline", "parallel", "two-pointer", "two pointer"],
         instruction: "Compose two copies (or two variants) of the standard device/process in series, parallel, or contact, and ask for the behavior of the composite — the wrong-but-tempting route treats the composite as a single standard instance.",
     },
     SetupMutation {
         key: "partial-obstruct",
+        trigger: "the mechanism has removable parts, pathways, terms, or inputs",
+        compatible_source_kinds: &["concept", "representation", "procedure"],
+        seed_triggers: &["part", "path", "term", "member", "aperture", "component", "input", "deletion", "missing"],
+        procedure_skill_triggers: &["deletion", "missing", "failure", "skip", "cancellation"],
         instruction: "Remove, block, or damage part of the standard apparatus (half the aperture, one term, one pathway, one member) and ask what survives and what degrades — probing which parts of the mechanism carry which parts of the output.",
     },
     SetupMutation {
         key: "clamp-agent",
+        trigger: "a varying state quantity can be externally held fixed with a nontrivial accounting cost",
+        compatible_source_kinds: &["concept", "representation"],
+        seed_triggers: &["current", "temperature", "length", "price", "concentration", "energy", "conservation", "accounting"],
+        procedure_skill_triggers: &[],
         instruction: "Introduce an ideal external agent that holds constant a quantity the standard process would let vary (current, temperature, length, price, concentration), and move the system quasistatically. Ask for the complete accounting: which reservoir supplies what, which absorbs what, and the ratio/sign the clamp forces — the classic trap is the naive count that forgets the clamp must pay.",
     },
     SetupMutation {
         key: "misalign",
+        trigger: "the standard result relies on alignment, synchronization, or tie ordering",
+        compatible_source_kinds: &["concept", "representation", "procedure"],
+        seed_triggers: &["align", "axis", "perpendicular", "synchron", "balance", "event", "ordering", "tie", "pointer"],
+        procedure_skill_triggers: &["event", "ordering", "tie", "synchron", "pointer"],
         instruction: "Break an alignment or symmetry the standard treatment assumes (on-axis, perpendicular, synchronized, balanced) by a controlled amount, and ask for the new relationship.",
     },
 ];
+
+/// Procedure sources only admit moves whose trigger can operate on an
+/// algorithmic decision. Most entries are naturally procedural; observational
+/// distortion is deliberately keyword-gated so it cannot decorate a procedure.
+const PROCEDURE_MOVE_KEYS: &[&str] = &[
+    "approximation-breakdown",
+    "false-symmetry",
+    "minimal-pair",
+    "modal-filter",
+    "limiting-case",
+    "counterexample-hunt",
+    "consistency-check",
+    "invariant-under-change",
+    "faithful-translation",
+    "resource-minimality",
+    "capacity-limit",
+    "edge-case",
+    "necessary-sufficient",
+    "ordering-dependence",
+    "constrained-tradeoff",
+    "hidden-assumption",
+    "flawed-argument",
+    "bounds-propagation",
+    "regime-shift",
+];
+
+const PROCEDURE_DISTORTION_TRIGGERS: &[&str] = &[
+    "event ordering",
+    "streaming",
+    "stream",
+    "offline",
+    "online",
+    "tie semantics",
+    "tie",
+    "memory constraint",
+    "memory",
+    "dynamic insertion",
+    "insertion",
+    "cancellation",
+    "sampling",
+];
+
+fn skill_has_any(skill: &str, triggers: &[&str]) -> bool {
+    let skill = skill.to_ascii_lowercase();
+    triggers.iter().any(|trigger| skill.contains(trigger))
+}
+
+pub fn move_compatible(move_: &AnalyticalMove, seed: &SeedProblem) -> bool {
+    match seed.source_kind.as_str() {
+        "" | "concept" | "representation" => true,
+        "procedure" if move_.key == "instrument-vs-truth" => {
+            skill_has_any(&seed.skill, PROCEDURE_DISTORTION_TRIGGERS)
+        }
+        "procedure" => PROCEDURE_MOVE_KEYS.contains(&move_.key),
+        _ => false,
+    }
+}
+
+pub fn mutation_compatible(mutation: &SetupMutation, seed: &SeedProblem) -> bool {
+    if seed.source_kind.is_empty() {
+        return true;
+    }
+    if !mutation
+        .compatible_source_kinds
+        .contains(&seed.source_kind.as_str())
+    {
+        return false;
+    }
+    let seed_trigger_text = format!("{} {} {}", seed.skill, seed.statement, seed.givens);
+    if !skill_has_any(&seed_trigger_text, mutation.seed_triggers) {
+        return false;
+    }
+    seed.source_kind != "procedure"
+        || skill_has_any(&seed.skill, mutation.procedure_skill_triggers)
+}
 
 #[allow(dead_code)] // prompt-side catalog lookup, used by render/tests
 pub fn find_mutation(key: &str) -> Option<&'static SetupMutation> {
@@ -285,7 +396,10 @@ pub struct Rung {
 pub const LADDER: &[Rung] = &[
     Rung { rung: 1, label: "foundation",  moves_per_item: 1, use_operator: false, cue_visibility: "high",   prior_rating: 1100.0, prior_deviation: 350.0 },
     Rung { rung: 2, label: "application", moves_per_item: 1, use_operator: false, cue_visibility: "medium", prior_rating: 1500.0, prior_deviation: 350.0 },
-    Rung { rung: 3, label: "stretch",     moves_per_item: 2, use_operator: false, cue_visibility: "low",    prior_rating: 1900.0, prior_deviation: 350.0 },
+    // Stretch is intentionally less sticky than the other structural priors:
+    // one clean blind solve is strong evidence that a nominal rung-3 item is
+    // easier than its composition plan suggested.
+    Rung { rung: 3, label: "stretch",     moves_per_item: 2, use_operator: false, cue_visibility: "low",    prior_rating: 1900.0, prior_deviation: 700.0 },
     Rung { rung: 4, label: "frontier",    moves_per_item: 2, use_operator: true,  cue_visibility: "low",    prior_rating: 2200.0, prior_deviation: 350.0 },
 ];
 
@@ -374,14 +488,23 @@ pub fn plan_assignments(
         let spec = rung(rung_number);
         for _ in 0..slots {
             let seed = &seeds[(offset + slot_index) % seeds.len().max(1)];
+            let compatible_moves: Vec<&AnalyticalMove> = MOVES
+                .iter()
+                .filter(|move_| move_compatible(move_, seed))
+                .collect();
             let mut move_keys = Vec::with_capacity(spec.moves_per_item);
             for move_number in 0..spec.moves_per_item {
-                let index = (offset + slot_index * 7 + move_number * 13) % MOVES.len();
-                let key = MOVES[index].key.to_owned();
+                let index =
+                    (offset + slot_index * 7 + move_number * 13) % compatible_moves.len();
+                let key = compatible_moves[index].key.to_owned();
                 if !move_keys.contains(&key) {
                     move_keys.push(key);
                 } else {
-                    move_keys.push(MOVES[(index + 1) % MOVES.len()].key.to_owned());
+                    move_keys.push(
+                        compatible_moves[(index + 1) % compatible_moves.len()]
+                            .key
+                            .to_owned(),
+                    );
                 }
             }
             let operators = if spec.use_operator {
@@ -393,7 +516,19 @@ pub fn plan_assignments(
             // deep_work mutates its upper rungs; olympiad_studio mutates and
             // bridges. Scholar stays with the standard setups.
             let mutations = if rung_number >= 3 && quality_tier != "scholar" {
-                vec![MUTATIONS[(offset + slot_index * 3) % MUTATIONS.len()].key.to_owned()]
+                let compatible: Vec<&SetupMutation> = MUTATIONS
+                    .iter()
+                    .filter(|mutation| mutation_compatible(mutation, seed))
+                    .collect();
+                if compatible.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        compatible[(offset + slot_index * 3) % compatible.len()]
+                            .key
+                            .to_owned(),
+                    ]
+                }
             } else {
                 Vec::new()
             };
@@ -426,6 +561,10 @@ mod tests {
                 givens: "givens".into(),
                 known_answer: "42".into(),
                 locator: "p. 1".into(),
+                source_path: "note.md".into(),
+                skill: "apply the governing concept".into(),
+                source_kind: "concept".into(),
+                representation_ambiguity: String::new(),
             })
             .collect()
     }
@@ -485,5 +624,33 @@ mod tests {
         for assignment in plan.iter().filter(|a| a.move_keys.len() == 2) {
             assert_ne!(assignment.move_keys[0], assignment.move_keys[1]);
         }
+    }
+
+    #[test]
+    fn procedure_distortions_require_a_matching_skill_trigger() {
+        let mut seed = seeds(1).remove(0);
+        seed.source_kind = "procedure".into();
+        seed.skill = "two-pointer sweep over sorted values".into();
+        let distortion = find_move("instrument-vs-truth").unwrap();
+        assert!(!move_compatible(distortion, &seed));
+        let plan = plan_assignments(40, &[seed.clone()], "procedure", "deep_work", 0.5);
+        assert!(plan.iter().all(|assignment| assignment
+            .move_keys
+            .iter()
+            .all(|key| move_compatible(find_move(key).unwrap(), &seed))));
+        assert!(plan.iter().all(|assignment| assignment
+            .mutations
+            .iter()
+            .all(|key| mutation_compatible(find_mutation(key).unwrap(), &seed))));
+        assert!(MUTATIONS
+            .iter()
+            .all(|mutation| !mutation_compatible(mutation, &seed)
+                || !mutation.procedure_skill_triggers.is_empty()));
+
+        seed.skill =
+            "two-pointer sweep with event ordering, tie semantics, and dynamic insertion".into();
+        assert!(move_compatible(distortion, &seed));
+        assert!(mutation_compatible(find_mutation("set-in-motion").unwrap(), &seed));
+        assert!(mutation_compatible(find_mutation("misalign").unwrap(), &seed));
     }
 }

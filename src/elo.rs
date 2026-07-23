@@ -59,7 +59,7 @@ fn expected_item_win(item_rating: f64, player_rating: f64) -> f64 {
 pub fn record_probe(state: &mut EloState, player: &ReferencePlayer, player_correct: bool, confidence: f64) {
     let outcome = if player_correct { 0.0 } else { 1.0 };
     let expected = expected_item_win(state.rating, player.rating);
-    let k = (state.deviation / 4.0).clamp(16.0, 88.0);
+    let k = (state.deviation / 4.0).clamp(16.0, 176.0);
     state.rating += k * (outcome - expected);
     state.deviation = (state.deviation * 0.85).max(140.0);
     state.provisional = true; // model probes alone never de-provision an item
@@ -101,6 +101,14 @@ mod tests {
         let mut state = new_state(2200.0, 350.0);
         record_probe(&mut state, &PROBE_STANDARD, true, 0.95);
         assert!(state.rating < 2200.0);
+    }
+
+    #[test]
+    fn a_solved_rung_three_prior_moves_down_substantially() {
+        let spec = crate::moves::rung(3);
+        let mut state = new_state(spec.prior_rating, spec.prior_deviation);
+        record_probe(&mut state, &PROBE_STANDARD, true, 0.95);
+        assert!(state.rating <= 1820.0, "rating only moved to {}", state.rating);
     }
 
     #[test]
