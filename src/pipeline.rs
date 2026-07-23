@@ -51,7 +51,7 @@ const AUTHOR_CHUNK: usize = 5;
 /// Concurrent chunks in flight. Each chunk holds ≤2 concurrent calls during
 /// its probe+review stage, so total concurrency stays provider-friendly.
 const CHUNK_CONCURRENCY: usize = 4;
-const CACHE_VERSION: &str = "v10";
+const CACHE_VERSION: &str = "v11";
 const MAX_SEEDS: usize = 12;
 
 pub struct PipelineConfig {
@@ -457,6 +457,33 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
             && review.essential_inferences > 0
             && (item.moves.rung < 3 || review.essential_inferences >= 2);
         item.difficulty.essential_inferences = review.essential_inferences;
+        // Accepting a question and trusting it as mastery evidence are two
+        // separate decisions: leakage or a generic-reasoning bypass keeps
+        // the item (it may still be a fine warm-up) but downgrades its
+        // delivered rung and its weight in the learner model.
+        let compromised = review.stem_leakage || !blind.used_target_skill;
+        item.validated_rung = if compromised {
+            1
+        } else if review.essential_inferences < 2 {
+            item.moves.rung.min(2)
+        } else {
+            item.moves.rung
+        };
+        let weight = if (0.0..=1.0).contains(&review.mastery_weight) {
+            review.mastery_weight
+        } else {
+            1.0
+        };
+        item.mastery_weight = if compromised { weight.min(0.35) } else { weight };
+        item.pedagogical_role = if compromised {
+            "enrichment".into()
+        } else {
+            match review.assessment_level.as_str() {
+                "recall" | "understanding" => "foundation".into(),
+                "application" => "application".into(),
+                _ => "transfer".into(),
+            }
+        };
         item.validation.presentation_gate = review.presentation;
         // Rungs 1–2 exist to produce standard, well-made questions;
         // "no novel insight" is not a defect there.
@@ -507,7 +534,10 @@ async fn process_chunk(job: ChunkJob<'_>) -> Result<()> {
         }
 
         if key_evidence && review_pass {
-            let spec = moves::rung(item.moves.rung);
+            // The Elo prior starts from the VALIDATED rung: a downgraded
+            // item must not enter the pool rated like the stretch item its
+            // composition plan aimed for.
+            let spec = moves::rung(item.validated_rung.max(1));
             let mut state = elo::new_state(spec.prior_rating, spec.prior_deviation);
             elo::record_probe(
                 &mut state,
@@ -1310,10 +1340,10 @@ async fn blind_probe(
 ) -> Result<Vec<BlindResult>> {
     let payload: Vec<Value> = candidates
         .iter()
-        .map(|q| json!({"item_id": q.id, "type": q.question_type, "stem": q.stem, "options": q.options}))
+        .map(|q| json!({"item_id": q.id, "type": q.question_type, "stem": q.stem, "options": q.options, "target_skill": q.target_skill}))
         .collect();
     let task = format!(
-        "Act as a blind correctness solver. Solve each problem independently and honestly. You have not received the author's key, solution, or source. FIRST, for each item, read only its stem and options and report in parse_issues anything you cannot pin down from the text alone: an undefined object (\"search in WHAT structure?\"), an unanchored scenario term (\"launch of WHAT?\"), an ambiguous quantifier, or an unclear asked quantity. parse_issues stays an empty string when every sentence parses in one read; needing to THINK to solve is not a parse issue, and do not report standard terms of the subject as issues. Then solve anyway under the most reasonable reading. Per item by type: mcq — choose answer_index 0..3 and leave answer_text empty; multi — set answer_text to ALL correct letters concatenated (e.g. \"AC\") and answer_index to the first; integer/decimal — put the numeric value in answer_text and set answer_index 0. Say whether each is unambiguously solvable, give calibrated confidence 0..1, and state any issue. Do not infer keys from option patterns. ITEMS:\n{}",
+        "Act as a blind correctness solver. Solve each problem independently and honestly. You have not received the author's key, solution, or source. Each item declares target_skill: the ability its author claims it measures — this is a claim to AUDIT, not a hint. After solving, report used_target_skill (did YOUR honest route genuinely require that skill?) and bypass_route: when generic reasoning (entailment from the stem, elimination, arithmetic) suffices without the skill, name that route in one clause, else leave it empty. FIRST, for each item, read only its stem and options and report in parse_issues anything you cannot pin down from the text alone: an undefined object (\"search in WHAT structure?\"), an unanchored scenario term (\"launch of WHAT?\"), an ambiguous quantifier, or an unclear asked quantity. parse_issues stays an empty string when every sentence parses in one read; needing to THINK to solve is not a parse issue, and do not report standard terms of the subject as issues. Then solve anyway under the most reasonable reading. Per item by type: mcq — choose answer_index 0..3 and leave answer_text empty; multi — set answer_text to ALL correct letters concatenated (e.g. \"AC\") and answer_index to the first; integer/decimal — put the numeric value in answer_text and set answer_index 0. Say whether each is unambiguously solvable, give calibrated confidence 0..1, and state any issue. Do not infer keys from option patterns. ITEMS:\n{}",
         serde_json::to_string(&payload)?
     );
     // Reasoning tokens count against max_tokens; a hard batch can burn the
@@ -1379,7 +1409,7 @@ async fn grounded_review(
         })
         .collect();
     let task = format!(
-        "Act as an independent grounded fidelity, construct, presentation, and novelty reviewer. The registered source envelope precedes this instruction. For each candidate: verify every tested premise and the key are supported by or validly derived from the envelope plus elementary prerequisites; check the worked solution for errors; reject copied or near-paraphrased source exercises; reject ambiguity, hidden conventions, cues that give the answer away, or distractors that are not genuinely plausible. Set presentation=false when code, shell text, or filenames appear inside math delimiters or \texttt instead of backtick inline code (a stray $ from code text breaks rendering). Set presentation=false for any stem that is not SELF-CONTAINED: if it references data, objects, quantities, or procedures that are only defined in the source (e.g. counts of an unstated thing, rows of an unstated structure, \"the process\" without saying which), the learner cannot even parse the question — the full setup must live in the stem, only the solution route may be hidden. Also set presentation=false when the stem coins or imports a compressed term (\"k-jump scan\", \"absent target\") without a one-clause gloss at first use — a learner who knows the topic must parse every phrase in one read; terms the source itself teaches need no gloss. Reject silently mixed time/unit representations. Items marked oracle_verdict=proved have machine-verified keys — do not second-guess the key itself, focus on fidelity, clarity, and construct. novelty=false means the item is routine formula substitution or recall; note that rung 1–2 items are ALLOWED to be standard applications (novelty is only enforced upstream for rung ≥ 3), so still report novelty honestly but judge construct_quality on fairness and correctness, not on brilliance. CONSTRUCT LITMUS: validate target_skill/where_used/why_necessary and set construct_quality=false if the claimed source skill is not load-bearing. Decisive counterfactual: remove the creative twist, or assume its preprocessing is already done; if the learner no longer needs the source technique, reject. Also reject when any prominent condition is inert—removing it changes neither answer, algorithmic decision, nor plausible distractor. A stated tie rule needs a real tie. For procedure seeds at rung ≥3 reject tiny inspectable instances, failure to execute the technique, unrelated preprocessing as the main work, or no invariant/pointer choice/boundary/complexity decision. Return essential_inferences as the confirmed number of dependent reasoning steps; fewer than two cannot pass rung ≥3. Set accept=true only when every applicable boolean gate is true. Keep each reason under 240 characters. CANDIDATES:\n{}",
+        "Act as an independent grounded fidelity, construct, presentation, and novelty reviewer. The registered source envelope precedes this instruction. For each candidate: verify every tested premise and the key are supported by or validly derived from the envelope plus elementary prerequisites; check the worked solution for errors; reject copied or near-paraphrased source exercises; reject ambiguity, hidden conventions, cues that give the answer away, or distractors that are not genuinely plausible. Set presentation=false when code, shell text, or filenames appear inside math delimiters or \texttt instead of backtick inline code (a stray $ from code text breaks rendering). Set presentation=false for any stem that is not SELF-CONTAINED: if it references data, objects, quantities, or procedures that are only defined in the source (e.g. counts of an unstated thing, rows of an unstated structure, \"the process\" without saying which), the learner cannot even parse the question — the full setup must live in the stem, only the solution route may be hidden. Also set presentation=false when the stem coins or imports a compressed term (\"k-jump scan\", \"absent target\") without a one-clause gloss at first use — a learner who knows the topic must parse every phrase in one read; terms the source itself teaches need no gloss. Reject silently mixed time/unit representations. Items marked oracle_verdict=proved have machine-verified keys — do not second-guess the key itself, focus on fidelity, clarity, and construct. novelty=false means the item is routine formula substitution or recall; note that rung 1–2 items are ALLOWED to be standard applications (novelty is only enforced upstream for rung ≥ 3), so still report novelty honestly but judge construct_quality on fairness and correctness, not on brilliance. CONSTRUCT LITMUS: validate target_skill/where_used/why_necessary and set construct_quality=false if the claimed source skill is not load-bearing. Decisive counterfactual: remove the creative twist, or assume its preprocessing is already done; if the learner no longer needs the source technique, reject. Also reject when any prominent condition is inert—removing it changes neither answer, algorithmic decision, nor plausible distractor. A stated tie rule needs a real tie. For procedure seeds at rung ≥3 reject tiny inspectable instances, failure to execute the technique, unrelated preprocessing as the main work, or no invariant/pointer choice/boundary/complexity decision. Return essential_inferences as the confirmed number of dependent reasoning steps; fewer than two cannot pass rung ≥3. Report stem_leakage=true when the stem states the very fact the item claims to test, so the learner repeats rather than retrieves — including any MUST-be-true item whose key is the only stem-entailed statement while every distractor merely adds an unsupported detail (that tests textual entailment, not the subject). Report distractor_independence=false when two or more distractors fall to one generic elimination; each distractor should embody a DISTINCT misconception about the source material. Report assessment_level (recall|understanding|application|transfer) for what the item actually demands, and mastery_weight 0..1: how strongly a correct answer evidences the declared target_skill (leaked or bypassable items rate low; items where the skill is the decisive bottleneck rate high). Set accept=true only when every applicable boolean gate is true. Keep each reason under 240 characters. CANDIDATES:\n{}",
         serde_json::to_string(&payload)?
     );
     let mut cap = (candidates.len() as u32 * 800).clamp(6_000, 12_000);
@@ -1877,8 +1907,9 @@ fn blind_schema(count: usize) -> Value {
                 "item_id": {"type": "string"}, "answer_index": {"type": "integer"}, "answer_text": {"type": "string"},
                 "solvable": {"type": "boolean"},
                 "confidence": {"type": "number"}, "issue": {"type": "string"},
-                "parse_issues": {"type": "string"}
-            }, "required": ["item_id", "answer_index", "answer_text", "solvable", "confidence", "issue", "parse_issues"]
+                "parse_issues": {"type": "string"},
+                "used_target_skill": {"type": "boolean"}, "bypass_route": {"type": "string"}
+            }, "required": ["item_id", "answer_index", "answer_text", "solvable", "confidence", "issue", "parse_issues", "used_target_skill", "bypass_route"]
         }),
     )
 }
@@ -1891,8 +1922,11 @@ fn review_schema(count: usize) -> Value {
                     "item_id": {"type": "string"}, "fidelity": {"type": "boolean"}, "correctness": {"type": "boolean"},
                     "construct_quality": {"type": "boolean"}, "presentation": {"type": "boolean"}, "novelty": {"type": "boolean"},
                     "diagram_consistent": {"type": "boolean"}, "essential_inferences": {"type": "integer"},
+                    "stem_leakage": {"type": "boolean"}, "distractor_independence": {"type": "boolean"},
+                    "assessment_level": {"type": "string", "enum": ["recall", "understanding", "application", "transfer"]},
+                    "mastery_weight": {"type": "number"},
                     "accept": {"type": "boolean"}, "reason": {"type": "string"}
-                }, "required": ["item_id", "fidelity", "correctness", "construct_quality", "presentation", "novelty", "diagram_consistent", "essential_inferences", "accept", "reason"]
+                }, "required": ["item_id", "fidelity", "correctness", "construct_quality", "presentation", "novelty", "diagram_consistent", "essential_inferences", "stem_leakage", "distractor_independence", "assessment_level", "mastery_weight", "accept", "reason"]
         }),
     )
 }
@@ -1984,6 +2018,9 @@ mod tests {
             why_necessary: "Without it the result is underdetermined.".into(),
             source_paths: vec!["note.pdf".into()],
             source_kind: "concept".into(),
+            validated_rung: 0,
+            mastery_weight: 1.0,
+            pedagogical_role: String::new(),
             distractor_rationales: vec!["r".into(); 4],
             evidence: vec![EvidenceRef { locator: "p. 2".into(), support: "The source supports the governing rule.".into() }],
             difficulty: DifficultyFeatures { essential_inferences: 2, representation_changes: 1, cue_visibility: "low".into(), distractor_attractiveness: "high".into(), computational_burden: "low".into() },

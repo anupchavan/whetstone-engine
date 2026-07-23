@@ -195,6 +195,9 @@ mod tests {
             why_necessary: String::new(),
             source_paths: vec![],
             source_kind: String::new(),
+            validated_rung: 0,
+            mastery_weight: 1.0,
+            pedagogical_role: String::new(),
             distractor_rationales: vec!["ok".into(); 4],
             evidence: vec![EvidenceRef {
                 locator: "p. 1".into(),

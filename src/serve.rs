@@ -712,7 +712,9 @@ fn select_session_notes(
     rel_paths: Vec<String>,
     count: usize,
 ) -> Vec<String> {
-    let cap = count.div_ceil(2).clamp(6, 16);
+    // Roughly two questions per note, ceilinged for context/cost sanity.
+    // No artificial floor: 10 questions should not force six notes in.
+    let cap = count.div_ceil(2).clamp(2, 16);
     if rel_paths.len() <= cap {
         return rel_paths;
     }
@@ -1195,21 +1197,20 @@ fn compose_envelopes(
     for source in loaded {
         let native_pdf = matches!(source.payload, crate::model::SourcePayload::Pdf(_))
             && source.extracted_text.trim().is_empty();
-        if native_pdf
-            || (!combine_all && source.extracted_text.trim().chars().count() >= SOLO_MIN_CHARS)
-        {
+        // Composition only pairs notes with a defensible relationship: big
+        // notes author alone, small ones pool per folder. Daily practice
+        // (combine_all) uses the same rule — cross-note questions come from
+        // same-folder envelopes, never from one vault-wide pool where OOP,
+        // SQL, and networking compete inside a single prompt.
+        let _ = combine_all;
+        if native_pdf || source.extracted_text.trim().chars().count() >= SOLO_MIN_CHARS {
             let rel = rel_of(&source);
             rel_by_hash.insert(source.sha256.clone(), vec![rel.clone()]);
             let mut source = source;
             source.note_paths = vec![rel];
             sources.push(source);
         } else {
-            // combine_all (daily practice) throws every note into ONE pool
-            // regardless of size or folder: interleaving topics inside an
-            // envelope is what lets a single question span several notes.
-            let folder = if combine_all {
-                String::new()
-            } else {
+            let folder = {
                 let rel = rel_of(&source);
                 rel.rsplit_once('/').map(|(dir, _)| dir.to_owned()).unwrap_or_default()
             };
@@ -1420,7 +1421,10 @@ fn question_set(
             .first()
             .cloned()
             .unwrap_or_else(|| item.source_name.clone());
-        let difficulty = match item.moves.rung {
+        // Validation may downgrade the planner's rung; the learner sees the
+        // evidence-based label, not the composition plan's ambition.
+        let rung = if item.validated_rung > 0 { item.validated_rung } else { item.moves.rung };
+        let difficulty = match rung {
             1 => "easy",
             2 => "medium",
             3 => "hard",
@@ -1464,6 +1468,8 @@ fn question_set(
             "source_title": note_title(&source_path),
             "source_path": source_path,
             "source_paths": source_paths,
+            "mastery_weight": item.mastery_weight,
+            "pedagogical_role": item.pedagogical_role,
             "difficulty": difficulty,
             "rating": item.elo.as_ref().map(|state| state.rating),
             "figure_svg": item.diagram_svg,
@@ -1556,10 +1562,18 @@ fn record_results(context: &mut ServeContext, params: &Value) -> Result<Value> {
         if total <= 0.0 {
             continue;
         }
+        // Optional per-note evidence weight (average mastery_weight of the
+        // note's questions): a session of leaked or bypassable warm-ups
+        // moves mastery proportionally less. Absent → full weight.
+        let weight = entry
+            .get("weight")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
         let state = context.learner.notes.entry(rel.to_owned()).or_default();
         let before = state.skill;
         let accuracy = correct / total;
-        state.skill = (state.skill + (accuracy - 0.5) * 12.0).clamp(0.0, 100.0);
+        state.skill = (state.skill + (accuracy - 0.5) * 12.0 * weight).clamp(0.0, 100.0);
         state.observations += total as u32;
         state.last_practiced = Some(now);
         state.interval_days = if accuracy >= 0.7 {

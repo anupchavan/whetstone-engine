@@ -184,6 +184,17 @@ pub struct CandidateQuestion {
     /// Source classification copied from the assigned seed.
     #[serde(default)]
     pub source_kind: String,
+    /// Post-validation rung: the planner's rung downgraded by evidence
+    /// (stem leakage, skill bypass, confirmed inferences). 0 = never
+    /// validated (legacy cache); consumers fall back to moves.rung.
+    #[serde(default)]
+    pub validated_rung: u8,
+    /// How strongly this item's outcome should move mastery, 0..1.
+    #[serde(default = "default_weight")]
+    pub mastery_weight: f64,
+    /// foundation | application | transfer | enrichment
+    #[serde(default)]
+    pub pedagogical_role: String,
     pub distractor_rationales: Vec<String>,
     pub evidence: Vec<EvidenceRef>,
     pub difficulty: DifficultyFeatures,
@@ -240,6 +251,22 @@ pub struct BlindResult {
     /// when the stem parses in one read.
     #[serde(default)]
     pub parse_issues: String,
+    /// Whether the solver's honest route genuinely needed the declared
+    /// target skill. Defaults true so legacy probes carry no penalty.
+    #[serde(default = "default_true")]
+    pub used_target_skill: bool,
+    /// The generic-reasoning route that suffices without the target skill;
+    /// empty when none exists.
+    #[serde(default)]
+    pub bypass_route: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_weight() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +281,18 @@ pub struct ReviewResult {
     /// Reviewer's confirmed count of dependent reasoning steps.
     #[serde(default)]
     pub essential_inferences: u8,
+    /// The stem states the very fact the item claims to test.
+    #[serde(default)]
+    pub stem_leakage: bool,
+    /// False when two or more distractors fall to one generic elimination.
+    #[serde(default = "default_true")]
+    pub distractor_independence: bool,
+    /// recall | understanding | application | transfer
+    #[serde(default)]
+    pub assessment_level: String,
+    /// How strongly a correct answer evidences the target skill, 0..1.
+    #[serde(default = "default_weight")]
+    pub mastery_weight: f64,
     pub accept: bool,
     pub reason: String,
 }
