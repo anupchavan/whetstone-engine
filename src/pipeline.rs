@@ -181,8 +181,21 @@ pub async fn run_pipeline(
     let seed_outcomes = futures::future::join_all(seed_futures).await;
     let mut seeds_by_hash: HashMap<String, Vec<SeedProblem>> = HashMap::new();
     let mut deficit = 0usize;
+    // One source failing hard (a provider error on its call) must not sink
+    // the whole job: its quota rolls into the make-up pass exactly like a
+    // seedless source. Only a job where EVERY source failed surfaces the
+    // provider error.
+    let mut last_source_error: Option<anyhow::Error> = None;
     for (source, outcome) in quota_sources.iter().zip(seed_outcomes) {
-        let seeds = outcome?;
+        let seeds = match outcome {
+            Ok(seeds) => seeds,
+            Err(error) => {
+                eprintln!("  {}: seeding failed ({error:#}); its quota rolls over", source.name);
+                deficit += quotas[&source.sha256];
+                last_source_error = Some(error);
+                continue;
+            }
+        };
         if seeds.is_empty() {
             eprintln!("  {}: no usable seeds; its quota rolls over", source.name);
             deficit += quotas[&source.sha256];
@@ -190,6 +203,11 @@ pub async fn run_pipeline(
         }
         set_seed_count(ledger, &source.sha256, seeds.len());
         seeds_by_hash.insert(source.sha256.clone(), seeds);
+    }
+    if seeds_by_hash.is_empty() {
+        if let Some(error) = last_source_error {
+            return Err(error.context("every selected note failed during seeding"));
+        }
     }
     checkpoint(config, ledger)?;
     let fill_futures: Vec<_> = quota_sources
@@ -204,7 +222,10 @@ pub async fn run_pipeline(
         })
         .collect();
     for outcome in futures::future::join_all(fill_futures).await {
-        outcome?;
+        if let Err(error) = outcome {
+            eprintln!("  a source's generation failed ({error:#}); the make-up pass compensates");
+            last_source_error = Some(error);
+        }
     }
     // Pass 2 (make-up): route any shortfall to the seed-richest sources.
     deficit += config
@@ -225,11 +246,16 @@ pub async fn run_pipeline(
         ranked.sort_by_key(|s| std::cmp::Reverse(seeds_by_hash[&s.sha256].len()));
         let Some(source) = ranked.first() else { break };
         let before = accept.current.lock().expect("accept lock").len();
-        fill_from_source(
+        if let Err(error) = fill_from_source(
             client, config, source, &seeds_by_hash[&source.sha256], shortfall, 100,
             &idempotency_key, &oracle, &accept, &semaphore, ledger,
         )
-        .await?;
+        .await
+        {
+            eprintln!("  make-up pass failed ({error:#})");
+            last_source_error = Some(error);
+            break;
+        }
         let after = accept.current.lock().expect("accept lock").len();
         if after == before {
             break; // the richest source is dry; fail closed below
@@ -239,6 +265,13 @@ pub async fn run_pipeline(
     {
         let mut guard = ledger.lock().expect("ledger lock");
         guard.accepted_count = accepted.len();
+    }
+    if accepted.is_empty() {
+        if let Some(error) = last_source_error {
+            set_status(ledger, "failed_closed");
+            checkpoint(config, ledger)?;
+            return Err(error.context("no source produced any accepted question"));
+        }
     }
     if accepted.len() != config.count {
         set_status(ledger, "incomplete_quality_gate");

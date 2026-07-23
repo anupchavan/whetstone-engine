@@ -713,12 +713,16 @@ impl AnthropicClient {
                     )
                 })?;
                 if body.get("is_error").and_then(Value::as_bool) == Some(true) {
-                    bail!(
-                        "claude failed during {phase}: {}",
-                        body.pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("no detail")
-                    );
+                    // The CLI reports errors in "result" (with a "subtype"
+                    // like error_max_turns), not under error.message.
+                    let detail = body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .or_else(|| body.get("result").and_then(Value::as_str))
+                        .filter(|text| !text.trim().is_empty())
+                        .or_else(|| body.get("subtype").and_then(Value::as_str))
+                        .unwrap_or("no detail");
+                    bail!("claude failed during {phase}: {detail}");
                 }
                 if let Some(structured) = body.get("structured_output") {
                     if !structured.is_null() {
