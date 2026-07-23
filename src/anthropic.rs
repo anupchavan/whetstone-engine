@@ -239,11 +239,6 @@ pub struct MessageSpec<'a> {
 }
 
 impl AnthropicClient {
-    pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set")?;
-        Self::from_key(api_key)
-    }
-
     pub fn from_provider(provider: &str, api_key: String) -> Result<Self> {
         let provider = Provider::parse(provider)?;
         if provider.is_cli() {
@@ -297,31 +292,6 @@ impl AnthropicClient {
         })
     }
 
-    /// Explicit key (e.g. from the app's Settings keychain), falling back to
-    /// the environment only when NO key was passed. The stored key is
-    /// authoritative — deleting it in Settings must really disable
-    /// generation, not silently fall through to a shell-exported key.
-    pub fn from_key(api_key: String) -> Result<Self> {
-        let api_key = if api_key.trim().is_empty() {
-            std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
-        } else {
-            api_key
-        };
-        if api_key.trim().is_empty() {
-            bail!("ANTHROPIC_API_KEY is empty");
-        }
-        let http = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .connect_timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Self {
-            http,
-            api_key,
-            base_url: "https://api.anthropic.com".to_owned(),
-            provider: Provider::Anthropic,
-            cli_path: None,
-        })
-    }
 
     /// Thread-safe call: budget is reserved atomically before the request and
     /// settled after, so concurrent calls cannot jointly breach the cap. The
